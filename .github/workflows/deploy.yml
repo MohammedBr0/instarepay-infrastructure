@@ -1,0 +1,183 @@
+name: Deploy to AWS EC2
+
+on:
+  push:
+    branches: [ main, dev ]
+  pull_request:
+    branches: [ main, dev ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [18.x, 20.x]
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js ${{ matrix.node-version }}
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ matrix.node-version }}
+        cache: 'pnpm'
+
+    - name: Install dependencies
+      run: |
+        cd InstaRepay-frontend
+        pnpm install
+
+    - name: Run linting
+      run: |
+        cd InstaRepay-frontend
+        pnpm run lint
+
+    - name: Run type checking
+      run: |
+        cd InstaRepay-frontend
+        pnpm run build
+
+    - name: Backend tests
+      run: |
+        cd loan-management-backend
+        npm install
+        npm run build
+
+  build-and-push:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev'
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Log in to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest,enable={{is_default_branch}}
+
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        platforms: linux/amd64
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+  deploy-staging:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/dev'
+    environment: staging
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-east-1
+
+    - name: Deploy to staging EC2
+      run: |
+        # Get staging instance IP
+        STAGING_IP=$(aws ec2 describe-instances \
+          --filters "Name=tag:Name,Values=InstaRepay-Staging" "Name=instance-state-name,Values=running" \
+          --query 'Reservations[0].Instances[0].PublicIpAddress' \
+          --output text)
+
+        if [ "$STAGING_IP" = "None" ] || [ -z "$STAGING_IP" ]; then
+          echo "No staging instance found. Please create one first."
+          exit 1
+        fi
+
+        echo "Deploying to staging: $STAGING_IP"
+
+        # Update deployment scripts with staging config
+        sed -i 's|EC2_PUBLIC_IP=.*|EC2_PUBLIC_IP='"$STAGING_IP"'|g' deploy.sh
+
+        # Run deployment
+        chmod +x deploy.sh
+        ./deploy.sh
+
+  deploy-production:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    environment: production
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-east-1
+
+    - name: Deploy to production EC2
+      run: |
+        # Get production instance IP
+        PROD_IP=$(aws ec2 describe-instances \
+          --filters "Name=tag:Name,Values=InstaRepay-Prod" "Name=instance-state-name,Values=running" \
+          --query 'Reservations[0].Instances[0].PublicIpAddress' \
+          --output text)
+
+        if [ "$PROD_IP" = "None" ] || [ -z "$PROD_IP" ]; then
+          echo "No production instance found. Please create one first."
+          exit 1
+        fi
+
+        echo "Deploying to production: $PROD_IP"
+
+        # Update deployment scripts with production config
+        sed -i 's|EC2_PUBLIC_IP=.*|EC2_PUBLIC_IP='"$PROD_IP"'|g' deploy.sh
+
+        # Run deployment
+        chmod +x deploy.sh
+        ./deploy.sh
+
+  notify:
+    needs: [deploy-staging, deploy-production]
+    runs-on: ubuntu-latest
+    if: always()
+
+    steps:
+    - name: Notify deployment status
+      run: |
+        if [ "${{ needs.deploy-staging.result }}" == "success" ] || [ "${{ needs.deploy-production.result }}" == "success" ]; then
+          echo "✅ Deployment successful!"
+        else
+          echo "❌ Deployment failed!"
+          exit 1
+        fi
